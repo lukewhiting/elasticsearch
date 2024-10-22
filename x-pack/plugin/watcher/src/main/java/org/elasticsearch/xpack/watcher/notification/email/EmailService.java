@@ -32,7 +32,6 @@ import java.util.Set;
 import java.util.function.Predicate;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
-
 import javax.mail.MessagingException;
 import javax.mail.internet.InternetAddress;
 import javax.net.ssl.SSLSocketFactory;
@@ -58,6 +57,13 @@ public class EmailService extends NotificationService<Account> {
 
     private static final Setting<List<String>> SETTING_DOMAIN_ALLOWLIST = Setting.stringListSetting(
         "xpack.notification.email.account.domain_allowlist",
+        List.of("*"),
+        Property.Dynamic,
+        Property.NodeScope
+    );
+
+    private static final Setting<List<String>> SETTING_DOMAIN_RECIPIENT_ALLOW_PATTERNS = Setting.stringListSetting(
+        "xpack.notification.email.recipient_allowlist",
         List.of("*"),
         Property.Dynamic,
         Property.NodeScope
@@ -167,6 +173,7 @@ public class EmailService extends NotificationService<Account> {
     private final CryptoService cryptoService;
     private final SSLService sslService;
     private volatile Set<String> allowedDomains;
+    private volatile Set<String> allowedRecipientPatterns;
 
     @SuppressWarnings("this-escape")
     public EmailService(Settings settings, @Nullable CryptoService cryptoService, SSLService sslService, ClusterSettings clusterSettings) {
@@ -192,13 +199,19 @@ public class EmailService extends NotificationService<Account> {
         clusterSettings.addAffixUpdateConsumer(SETTING_SMTP_SEND_PARTIAL, (s, o) -> {}, (s, o) -> {});
         clusterSettings.addAffixUpdateConsumer(SETTING_SMTP_WAIT_ON_QUIT, (s, o) -> {}, (s, o) -> {});
         this.allowedDomains = new HashSet<>(SETTING_DOMAIN_ALLOWLIST.get(settings));
+        this.allowedRecipientPatterns = new HashSet<>(SETTING_DOMAIN_RECIPIENT_ALLOW_PATTERNS.get(settings));
         clusterSettings.addSettingsUpdateConsumer(SETTING_DOMAIN_ALLOWLIST, this::updateAllowedDomains);
+        clusterSettings.addSettingsUpdateConsumer(SETTING_DOMAIN_RECIPIENT_ALLOW_PATTERNS, this::updateAllowedRecipientPatterns);
         // do an initial load
         reload(settings);
     }
 
     void updateAllowedDomains(List<String> newDomains) {
         this.allowedDomains = new HashSet<>(newDomains);
+    }
+
+    void updateAllowedRecipientPatterns(List<String> newPatterns) {
+        this.allowedRecipientPatterns = new HashSet<>(newPatterns);
     }
 
     @Override
@@ -304,6 +317,7 @@ public class EmailService extends NotificationService<Account> {
         return Arrays.asList(
             SETTING_DEFAULT_ACCOUNT,
             SETTING_DOMAIN_ALLOWLIST,
+            SETTING_DOMAIN_RECIPIENT_ALLOW_PATTERNS,
             SETTING_PROFILE,
             SETTING_EMAIL_DEFAULTS,
             SETTING_SMTP_AUTH,
