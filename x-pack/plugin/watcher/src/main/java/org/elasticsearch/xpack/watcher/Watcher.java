@@ -890,31 +890,45 @@ public class Watcher extends Plugin implements SystemIndexPlugin, ScriptPlugin, 
                     builder.field(SystemIndexDescriptor.VERSION_META_KEY, WATCHES_INDEX_MAPPINGS_VERSION);
                     builder.endObject();
                 }
+//                {
+//                    builder.startObject("runtime");
+//                    {
+//                        builder.startObject("watch_name");
+//                        builder.field("type", "keyword");
+//                        {
+//                            builder.startObject("script");
+//                            builder.field("source", "emit(doc['_source'].value)");
+//                            builder.endObject();
+//                        }
+//                        builder.endObject();
+//                    }
+//                    builder.endObject();
+//                }
                 {
                     builder.startObject("properties");
                     {
-                        builder.startObject("status");
-                        builder.field("type", "object");
-                        builder.field("enabled", false);
-                        builder.field("dynamic", true);
-
-                        builder.startObject("properties");
                         {
-                            builder.startObject("state");
+                            builder.startObject("status");
+                            builder.field("type", "object");
+                            builder.field("enabled", false);
+                            builder.field("dynamic", true);
+
+                            builder.startObject("properties");
                             {
+                                builder.startObject("state");
                                 builder.field("type", "object");
                                 builder.field("dynamic", true);
                                 builder.field("enabled", false);
-                                builder.startObject("properties");
                                 {
+                                    builder.startObject("properties");
                                     builder.startObject("active");
                                     builder.field("type", "boolean");
                                     builder.field("index", true);
                                     builder.endObject();
+                                    builder.endObject();
                                 }
                                 builder.endObject();
                             }
-                            builder.endObject();
 
                             builder.startObject("last_met_condition");
                             builder.field("type", "date");
@@ -927,8 +941,8 @@ public class Watcher extends Plugin implements SystemIndexPlugin, ScriptPlugin, 
                             builder.endObject();
 
                             builder.endObject();
+                            builder.endObject();
                         }
-                        builder.endObject();
 
                         builder.startObject("trigger");
                         builder.field("type", "object");
