@@ -6,6 +6,7 @@
  */
 package org.elasticsearch.xpack.core.ilm;
 
+import org.elasticsearch.TransportVersion;
 import org.elasticsearch.client.internal.Client;
 import org.elasticsearch.cluster.metadata.IndexMetadata;
 import org.elasticsearch.cluster.routing.allocation.decider.ShardsLimitAllocationDecider;
@@ -27,11 +28,16 @@ import java.util.Objects;
 public class AllocateAction implements LifecycleAction {
 
     public static final String NAME = "allocate";
+    public static final TransportVersion ILM_ALLOCATE_REMOVE_AUTO_EXPAND_REPLICAS = TransportVersion.fromName(
+        "ilm_allocate_remove_auto_expand_replicas"
+    );
+
     public static final ParseField NUMBER_OF_REPLICAS_FIELD = new ParseField("number_of_replicas");
     public static final ParseField TOTAL_SHARDS_PER_NODE_FIELD = new ParseField("total_shards_per_node");
     public static final ParseField INCLUDE_FIELD = new ParseField("include");
     public static final ParseField EXCLUDE_FIELD = new ParseField("exclude");
     public static final ParseField REQUIRE_FIELD = new ParseField("require");
+    public static final ParseField REMOVE_AUTO_EXPAND_REPLICAS_FIELD = new ParseField("remove_auto_expand_replicas");
 
     @SuppressWarnings("unchecked")
     private static final ConstructingObjectParser<AllocateAction, Void> PARSER = new ConstructingObjectParser<>(
@@ -41,7 +47,8 @@ public class AllocateAction implements LifecycleAction {
             (Integer) a[1],
             (Map<String, String>) a[2],
             (Map<String, String>) a[3],
-            (Map<String, String>) a[4]
+            (Map<String, String>) a[4],
+            (Boolean) a[5]
         )
     );
 
@@ -51,6 +58,7 @@ public class AllocateAction implements LifecycleAction {
         PARSER.declareObject(ConstructingObjectParser.optionalConstructorArg(), (p, c) -> p.mapStrings(), INCLUDE_FIELD);
         PARSER.declareObject(ConstructingObjectParser.optionalConstructorArg(), (p, c) -> p.mapStrings(), EXCLUDE_FIELD);
         PARSER.declareObject(ConstructingObjectParser.optionalConstructorArg(), (p, c) -> p.mapStrings(), REQUIRE_FIELD);
+        PARSER.declareBoolean(ConstructingObjectParser.optionalConstructorArg(), REMOVE_AUTO_EXPAND_REPLICAS_FIELD);
     }
 
     private final Integer numberOfReplicas;
@@ -58,6 +66,7 @@ public class AllocateAction implements LifecycleAction {
     private final Map<String, String> include;
     private final Map<String, String> exclude;
     private final Map<String, String> require;
+    private final Boolean removeAutoExpandReplicas;
 
     public static AllocateAction parse(XContentParser parser) {
         return PARSER.apply(parser, null);
@@ -69,6 +78,17 @@ public class AllocateAction implements LifecycleAction {
         Map<String, String> include,
         Map<String, String> exclude,
         Map<String, String> require
+    ) {
+        this(numberOfReplicas, totalShardsPerNode, include, exclude, require, null);
+    }
+
+    public AllocateAction(
+        Integer numberOfReplicas,
+        Integer totalShardsPerNode,
+        Map<String, String> include,
+        Map<String, String> exclude,
+        Map<String, String> require,
+        Boolean removeAutoExpandReplicas
     ) {
         if (include == null) {
             this.include = Map.of();
@@ -84,6 +104,15 @@ public class AllocateAction implements LifecycleAction {
             this.require = Map.of();
         } else {
             this.require = require;
+        }
+        if (Boolean.TRUE.equals(removeAutoExpandReplicas) && numberOfReplicas == null) {
+            throw new IllegalArgumentException(
+                "["
+                    + REMOVE_AUTO_EXPAND_REPLICAS_FIELD.getPreferredName()
+                    + "] can only be used when ["
+                    + NUMBER_OF_REPLICAS_FIELD.getPreferredName()
+                    + "] is set"
+            );
         }
         if (this.include.isEmpty()
             && this.exclude.isEmpty()
@@ -114,6 +143,7 @@ public class AllocateAction implements LifecycleAction {
             throw new IllegalArgumentException("[" + TOTAL_SHARDS_PER_NODE_FIELD.getPreferredName() + "] must be >= -1");
         }
         this.totalShardsPerNode = totalShardsPerNode;
+        this.removeAutoExpandReplicas = removeAutoExpandReplicas;
     }
 
     @SuppressWarnings("unchecked")
@@ -123,7 +153,8 @@ public class AllocateAction implements LifecycleAction {
             in.readOptionalInt(),
             (Map<String, String>) in.readGenericValue(),
             (Map<String, String>) in.readGenericValue(),
-            (Map<String, String>) in.readGenericValue()
+            (Map<String, String>) in.readGenericValue(),
+            in.getTransportVersion().supports(ILM_ALLOCATE_REMOVE_AUTO_EXPAND_REPLICAS) ? in.readOptionalBoolean() : null
         );
     }
 
@@ -147,6 +178,10 @@ public class AllocateAction implements LifecycleAction {
         return require;
     }
 
+    public Boolean getRemoveAutoExpandReplicas() {
+        return removeAutoExpandReplicas;
+    }
+
     @Override
     public void writeTo(StreamOutput out) throws IOException {
         out.writeOptionalVInt(numberOfReplicas);
@@ -154,6 +189,9 @@ public class AllocateAction implements LifecycleAction {
         out.writeGenericValue(include);
         out.writeGenericValue(exclude);
         out.writeGenericValue(require);
+        if (out.getTransportVersion().supports(ILM_ALLOCATE_REMOVE_AUTO_EXPAND_REPLICAS)) {
+            out.writeOptionalBoolean(removeAutoExpandReplicas);
+        }
     }
 
     @Override
@@ -173,6 +211,9 @@ public class AllocateAction implements LifecycleAction {
         builder.stringStringMap(INCLUDE_FIELD.getPreferredName(), include);
         builder.stringStringMap(EXCLUDE_FIELD.getPreferredName(), exclude);
         builder.stringStringMap(REQUIRE_FIELD.getPreferredName(), require);
+        if (removeAutoExpandReplicas != null) {
+            builder.field(REMOVE_AUTO_EXPAND_REPLICAS_FIELD.getPreferredName(), removeAutoExpandReplicas);
+        }
         builder.endObject();
         return builder;
     }
@@ -191,6 +232,9 @@ public class AllocateAction implements LifecycleAction {
         if (numberOfReplicas != null) {
             newSettings.put(IndexMetadata.SETTING_NUMBER_OF_REPLICAS, numberOfReplicas);
         }
+        if (Boolean.TRUE.equals(removeAutoExpandReplicas)) {
+            newSettings.putNull(IndexMetadata.SETTING_AUTO_EXPAND_REPLICAS);
+        }
         include.forEach((key, value) -> newSettings.put(IndexMetadata.INDEX_ROUTING_INCLUDE_GROUP_SETTING.getKey() + key, value));
         exclude.forEach((key, value) -> newSettings.put(IndexMetadata.INDEX_ROUTING_EXCLUDE_GROUP_SETTING.getKey() + key, value));
         require.forEach((key, value) -> newSettings.put(IndexMetadata.INDEX_ROUTING_REQUIRE_GROUP_SETTING.getKey() + key, value));
@@ -204,7 +248,7 @@ public class AllocateAction implements LifecycleAction {
 
     @Override
     public int hashCode() {
-        return Objects.hash(numberOfReplicas, totalShardsPerNode, include, exclude, require);
+        return Objects.hash(numberOfReplicas, totalShardsPerNode, include, exclude, require, removeAutoExpandReplicas);
     }
 
     @Override
@@ -220,7 +264,8 @@ public class AllocateAction implements LifecycleAction {
             && Objects.equals(totalShardsPerNode, other.totalShardsPerNode)
             && Objects.equals(include, other.include)
             && Objects.equals(exclude, other.exclude)
-            && Objects.equals(require, other.require);
+            && Objects.equals(require, other.require)
+            && Objects.equals(removeAutoExpandReplicas, other.removeAutoExpandReplicas);
     }
 
     @Override

@@ -20,6 +20,7 @@ import java.util.Map;
 
 import static org.elasticsearch.cluster.routing.allocation.decider.ShardsLimitAllocationDecider.INDEX_TOTAL_SHARDS_PER_NODE_SETTING;
 import static org.elasticsearch.xpack.core.ilm.AllocateAction.NUMBER_OF_REPLICAS_FIELD;
+import static org.elasticsearch.xpack.core.ilm.AllocateAction.REMOVE_AUTO_EXPAND_REPLICAS_FIELD;
 import static org.elasticsearch.xpack.core.ilm.AllocateAction.TOTAL_SHARDS_PER_NODE_FIELD;
 import static org.hamcrest.Matchers.equalTo;
 import static org.hamcrest.Matchers.is;
@@ -60,7 +61,11 @@ public class AllocateActionTests extends AbstractActionTestCase<AllocateAction> 
         }
         Integer numberOfReplicas = randomBoolean() ? null : randomIntBetween(0, 10);
         Integer totalShardsPerNode = randomBoolean() ? null : randomIntBetween(-1, 10);
-        return new AllocateAction(numberOfReplicas, totalShardsPerNode, includes, excludes, requires);
+        Boolean removeAutoExpandReplicas = randomBoolean() ? null : randomBoolean();
+        if (Boolean.TRUE.equals(removeAutoExpandReplicas) && numberOfReplicas == null) {
+            numberOfReplicas = randomIntBetween(0, 10);
+        }
+        return new AllocateAction(numberOfReplicas, totalShardsPerNode, includes, excludes, requires, removeAutoExpandReplicas);
     }
 
     @Override
@@ -75,7 +80,8 @@ public class AllocateActionTests extends AbstractActionTestCase<AllocateAction> 
         Map<String, String> require = instance.getRequire();
         Integer numberOfReplicas = instance.getNumberOfReplicas();
         Integer totalShardsPerNode = instance.getTotalShardsPerNode();
-        switch (randomIntBetween(0, 4)) {
+        Boolean removeAutoExpandReplicas = instance.getRemoveAutoExpandReplicas();
+        switch (randomIntBetween(0, 5)) {
             case 0 -> {
                 include = new HashMap<>(include);
                 include.put(randomAlphaOfLengthBetween(11, 15), randomAlphaOfLengthBetween(1, 20));
@@ -90,9 +96,15 @@ public class AllocateActionTests extends AbstractActionTestCase<AllocateAction> 
             }
             case 3 -> numberOfReplicas = randomIntBetween(11, 20);
             case 4 -> totalShardsPerNode = randomIntBetween(11, 20);
+            case 5 -> {
+                removeAutoExpandReplicas = removeAutoExpandReplicas == null ? randomBoolean() : (removeAutoExpandReplicas == false);
+                if (Boolean.TRUE.equals(removeAutoExpandReplicas) && numberOfReplicas == null) {
+                    numberOfReplicas = randomIntBetween(0, 10);
+                }
+            }
             default -> throw new AssertionError("Illegal randomisation branch");
         }
-        return new AllocateAction(numberOfReplicas, totalShardsPerNode, include, exclude, require);
+        return new AllocateAction(numberOfReplicas, totalShardsPerNode, include, exclude, require, removeAutoExpandReplicas);
     }
 
     public void testAllMapsNullOrEmpty() {
@@ -185,11 +197,52 @@ public class AllocateActionTests extends AbstractActionTestCase<AllocateAction> 
         if (action.getTotalShardsPerNode() != null) {
             expectedSettings.put(ShardsLimitAllocationDecider.INDEX_TOTAL_SHARDS_PER_NODE_SETTING.getKey(), action.getTotalShardsPerNode());
         }
+        if (Boolean.TRUE.equals(action.getRemoveAutoExpandReplicas())) {
+            expectedSettings.putNull(IndexMetadata.SETTING_AUTO_EXPAND_REPLICAS);
+        }
 
         assertThat(firstStep.getSettingsSupplier().apply(null), equalTo(expectedSettings.build()));
         AllocationRoutedStep secondStep = (AllocationRoutedStep) steps.get(1);
         assertEquals(expectedSecondStepKey, secondStep.getKey());
         assertEquals(nextStepKey, secondStep.getNextStepKey());
+    }
+
+    public void testRemoveAutoExpandReplicas() {
+        Integer numberOfReplicas = randomIntBetween(0, 4);
+        String phase = randomAlphaOfLengthBetween(1, 10);
+        StepKey nextStepKey = new StepKey(
+            randomAlphaOfLengthBetween(1, 10),
+            randomAlphaOfLengthBetween(1, 10),
+            randomAlphaOfLengthBetween(1, 10)
+        );
+
+        AllocateAction action = new AllocateAction(numberOfReplicas, null, null, null, null, Boolean.TRUE);
+        List<Step> steps = action.toSteps(null, phase, nextStepKey);
+        UpdateSettingsStep firstStep = (UpdateSettingsStep) steps.get(0);
+        Settings actualSettings = firstStep.getSettingsSupplier().apply(null);
+        assertTrue(actualSettings.keySet().contains(IndexMetadata.SETTING_AUTO_EXPAND_REPLICAS));
+        assertNull(actualSettings.get(IndexMetadata.SETTING_AUTO_EXPAND_REPLICAS));
+
+        action = new AllocateAction(numberOfReplicas, null, null, null, null, null);
+        steps = action.toSteps(null, phase, nextStepKey);
+        firstStep = (UpdateSettingsStep) steps.get(0);
+        actualSettings = firstStep.getSettingsSupplier().apply(null);
+        assertFalse(actualSettings.keySet().contains(IndexMetadata.SETTING_AUTO_EXPAND_REPLICAS));
+    }
+
+    public void testRemoveAutoExpandReplicasWithoutNumberOfReplicas() {
+        IllegalArgumentException exception = expectThrows(
+            IllegalArgumentException.class,
+            () -> new AllocateAction(null, null, null, null, null, Boolean.TRUE)
+        );
+        assertEquals(
+            "["
+                + REMOVE_AUTO_EXPAND_REPLICAS_FIELD.getPreferredName()
+                + "] can only be used when ["
+                + NUMBER_OF_REPLICAS_FIELD.getPreferredName()
+                + "] is set",
+            exception.getMessage()
+        );
     }
 
     public void testTotalNumberOfShards() throws Exception {

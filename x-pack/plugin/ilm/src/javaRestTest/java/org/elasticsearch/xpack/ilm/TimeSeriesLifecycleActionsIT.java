@@ -263,6 +263,29 @@ public class TimeSeriesLifecycleActionsIT extends IlmESRestTestCase {
         });
     }
 
+    public void testAllocateActionRemovesAutoExpandReplicas() throws Exception {
+        int numShards = randomFrom(1, 5);
+        createIndexWithSettings(
+            client(),
+            index,
+            alias,
+            Settings.builder()
+                .put(IndexMetadata.SETTING_NUMBER_OF_SHARDS, numShards)
+                .put(IndexMetadata.SETTING_NUMBER_OF_REPLICAS, 1)
+                .put(IndexMetadata.SETTING_AUTO_EXPAND_REPLICAS, "0-1")
+        );
+        AllocateAction allocateAction = new AllocateAction(0, null, null, null, null, Boolean.TRUE);
+        String endPhase = randomFrom("warm", "cold");
+        createNewSingletonPolicy(client(), policy, endPhase, allocateAction);
+        updatePolicy(client(), index, policy);
+        assertBusy(() -> {
+            Map<String, Object> settings = getOnlyIndexSettings(client(), index);
+            assertThat(getStepKeyForIndex(client(), index), equalTo(PhaseCompleteStep.finalStep(endPhase).getKey()));
+            assertThat(settings.get(IndexMetadata.INDEX_NUMBER_OF_REPLICAS_SETTING.getKey()), equalTo("0"));
+            assertThat(settings.get(IndexMetadata.SETTING_AUTO_EXPAND_REPLICAS), nullValue());
+        }, 30, TimeUnit.SECONDS);
+    }
+
     @SuppressWarnings("unchecked")
     public void testWaitForSnapshot() throws Exception {
         createIndexWithSettings(
