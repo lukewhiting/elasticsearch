@@ -11,6 +11,7 @@ package org.elasticsearch.action.bulk;
 
 import org.elasticsearch.ElasticsearchException;
 import org.elasticsearch.ExceptionsHelper;
+import org.elasticsearch.TransportVersion;
 import org.elasticsearch.action.DocWriteRequest.OpType;
 import org.elasticsearch.action.DocWriteResponse;
 import org.elasticsearch.action.delete.DeleteResponse;
@@ -21,6 +22,7 @@ import org.elasticsearch.common.Strings;
 import org.elasticsearch.common.io.stream.StreamInput;
 import org.elasticsearch.common.io.stream.StreamOutput;
 import org.elasticsearch.common.io.stream.Writeable;
+import org.elasticsearch.core.Nullable;
 import org.elasticsearch.index.seqno.SequenceNumbers;
 import org.elasticsearch.index.shard.ShardId;
 import org.elasticsearch.rest.RestStatus;
@@ -58,7 +60,12 @@ public class BulkItemResponse implements Writeable, ToXContentObject {
             builder.field(STATUS, failure.getStatus().getStatus());
             failure.getFailureStoreStatus().toXContent(builder, params);
             builder.startObject(ERROR);
-            ElasticsearchException.generateThrowableXContent(builder, params, failure.getCause());
+            ElasticsearchException.generateThrowableXContentWithSuppressed(
+                builder,
+                params,
+                failure.getCause(),
+                failure.getFailureStoreCause()
+            );
             builder.endObject();
         }
         builder.endObject();
@@ -75,6 +82,8 @@ public class BulkItemResponse implements Writeable, ToXContentObject {
         public static final String CAUSE_FIELD = "cause";
         public static final String STATUS_FIELD = "status";
 
+        public static final TransportVersion BULK_ITEM_FAILURE_STORE_CAUSE = TransportVersion.fromName("bulk_item_failure_store_cause");
+
         private final String index;
         private final String id;
         private final Exception cause;
@@ -83,6 +92,8 @@ public class BulkItemResponse implements Writeable, ToXContentObject {
         private final long term;
         private final boolean aborted;
         private IndexDocFailureStoreStatus failureStoreStatus;
+        @Nullable
+        private Exception failureStoreCause;
 
         /**
          * For write failures before operation was assigned a sequence number.
@@ -206,6 +217,7 @@ public class BulkItemResponse implements Writeable, ToXContentObject {
             term = in.readVLong();
             aborted = in.readBoolean();
             failureStoreStatus = IndexDocFailureStoreStatus.read(in);
+            failureStoreCause = in.getTransportVersion().supports(BULK_ITEM_FAILURE_STORE_CAUSE) ? in.readOptionalException() : null;
         }
 
         @Override
@@ -217,6 +229,10 @@ public class BulkItemResponse implements Writeable, ToXContentObject {
             out.writeVLong(term);
             out.writeBoolean(aborted);
             failureStoreStatus.writeTo(out);
+            // The field is only set once every node supports it, until then the exception is a suppressed exception of the cause.
+            if (out.getTransportVersion().supports(BULK_ITEM_FAILURE_STORE_CAUSE)) {
+                out.writeOptionalException(failureStoreCause);
+            }
         }
 
         /**
@@ -289,6 +305,21 @@ public class BulkItemResponse implements Writeable, ToXContentObject {
             this.failureStoreStatus = failureStoreStatus;
         }
 
+        /**
+         * The exception that stopped this item from being stored in the failure store, or {@code null} if there was none. It is kept apart
+         * from {@link #getCause()} because the cause can be shared by all items of a failed shard bulk, while each item has its own failure
+         * store failure. It is rendered as the last suppressed exception of the cause.
+         */
+        @Nullable
+        public Exception getFailureStoreCause() {
+            return failureStoreCause;
+        }
+
+        public void setFailureStoreCause(Exception failureStoreCause) {
+            assert this.failureStoreCause == null : "an item can only fail to be stored in the failure store once";
+            this.failureStoreCause = failureStoreCause;
+        }
+
         @Override
         public XContentBuilder toXContent(XContentBuilder builder, Params params) throws IOException {
             builder.field(INDEX_FIELD, index);
@@ -296,7 +327,7 @@ public class BulkItemResponse implements Writeable, ToXContentObject {
                 builder.field(ID_FIELD, id);
             }
             builder.startObject(CAUSE_FIELD);
-            ElasticsearchException.generateThrowableXContent(builder, params, cause);
+            ElasticsearchException.generateThrowableXContentWithSuppressed(builder, params, cause, failureStoreCause);
             builder.endObject();
             builder.field(STATUS_FIELD, status.getStatus());
             failureStoreStatus.toXContent(builder, params);

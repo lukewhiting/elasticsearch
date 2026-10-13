@@ -22,7 +22,10 @@ import org.elasticsearch.action.support.replication.ReplicationResponse;
 import org.elasticsearch.action.update.UpdateResponse;
 import org.elasticsearch.action.update.UpdateResponseTests;
 import org.elasticsearch.cluster.metadata.IndexMetadata;
+import org.elasticsearch.common.Strings;
+import org.elasticsearch.common.bytes.BytesArray;
 import org.elasticsearch.common.bytes.BytesReference;
+import org.elasticsearch.common.xcontent.XContentHelper;
 import org.elasticsearch.core.CheckedConsumer;
 import org.elasticsearch.core.Tuple;
 import org.elasticsearch.index.Index;
@@ -30,10 +33,13 @@ import org.elasticsearch.index.seqno.SequenceNumbers;
 import org.elasticsearch.index.shard.ShardId;
 import org.elasticsearch.rest.RestStatus;
 import org.elasticsearch.test.ESTestCase;
+import org.elasticsearch.test.TransportVersionUtils;
+import org.elasticsearch.test.rest.ObjectPath;
 import org.elasticsearch.xcontent.ToXContent;
 import org.elasticsearch.xcontent.XContentBuilder;
 import org.elasticsearch.xcontent.XContentParser;
 import org.elasticsearch.xcontent.XContentType;
+import org.elasticsearch.xcontent.json.JsonXContent;
 
 import java.io.IOException;
 
@@ -42,6 +48,9 @@ import static org.elasticsearch.ElasticsearchExceptionTests.randomExceptions;
 import static org.elasticsearch.common.xcontent.XContentParserUtils.ensureExpectedToken;
 import static org.elasticsearch.common.xcontent.XContentParserUtils.throwUnknownField;
 import static org.hamcrest.Matchers.containsString;
+import static org.hamcrest.Matchers.equalTo;
+import static org.hamcrest.Matchers.instanceOf;
+import static org.hamcrest.Matchers.nullValue;
 
 public class BulkItemResponseTests extends ESTestCase {
 
@@ -164,6 +173,94 @@ public class BulkItemResponseTests extends ESTestCase {
             assertNull(parser.nextToken());
         }
         assertBulkItemResponse(expectedBulkItemResponse, parsedBulkItemResponse);
+    }
+
+    /**
+     * The failure store cause belongs to one item while the cause may be shared by many items, so it must be rendered as the last
+     * suppressed exception without being added to the cause itself.
+     */
+    public void testFailureStoreCauseIsRenderedAsLastSuppressedException() throws IOException {
+        Exception cause = new ElasticsearchException("original failure");
+        cause.addSuppressed(new IllegalStateException("existing suppressed"));
+        Failure failure = new Failure("index", "id", cause);
+        failure.setFailureStoreStatus(IndexDocFailureStoreStatus.FAILED);
+        failure.setFailureStoreCause(new IllegalArgumentException("failure store failure"));
+        BulkItemResponse item = BulkItemResponse.failure(0, DocWriteRequest.OpType.CREATE, failure);
+
+        ObjectPath itemJson = ObjectPath.createFromXContent(
+            JsonXContent.jsonXContent,
+            XContentHelper.toXContent(item, XContentType.JSON, randomBoolean())
+        );
+        assertThat(itemJson.evaluate("create.error.reason"), equalTo("original failure"));
+        assertThat(itemJson.evaluate("create.error.suppressed.0.reason"), equalTo("existing suppressed"));
+        assertThat(itemJson.evaluate("create.error.suppressed.1.reason"), equalTo("failure store failure"));
+        assertThat(itemJson.evaluate("create.failure_store"), equalTo("failed"));
+
+        ObjectPath failureJson = ObjectPath.createFromXContent(JsonXContent.jsonXContent, new BytesArray(Strings.toString(failure)));
+        assertThat(failureJson.evaluate("cause.suppressed.0.reason"), equalTo("existing suppressed"));
+        assertThat(failureJson.evaluate("cause.suppressed.1.reason"), equalTo("failure store failure"));
+
+        assertThat(cause.getSuppressed().length, equalTo(1));
+    }
+
+    public void testFailureStoreCauseCreatesSuppressedArrayWhenCauseHasNone() throws IOException {
+        Failure failure = new Failure("index", "id", new ElasticsearchException("original failure"));
+        failure.setFailureStoreCause(new IllegalArgumentException("failure store failure"));
+        BulkItemResponse item = BulkItemResponse.failure(0, DocWriteRequest.OpType.CREATE, failure);
+
+        ObjectPath itemJson = ObjectPath.createFromXContent(
+            JsonXContent.jsonXContent,
+            XContentHelper.toXContent(item, XContentType.JSON, randomBoolean())
+        );
+        assertThat(itemJson.evaluate("create.error.suppressed.0.reason"), equalTo("failure store failure"));
+    }
+
+    public void testNoSuppressedArrayWithoutFailureStoreCause() throws IOException {
+        Failure failure = new Failure("index", "id", new ElasticsearchException("original failure"));
+        BulkItemResponse item = BulkItemResponse.failure(0, DocWriteRequest.OpType.CREATE, failure);
+
+        ObjectPath itemJson = ObjectPath.createFromXContent(
+            JsonXContent.jsonXContent,
+            XContentHelper.toXContent(item, XContentType.JSON, randomBoolean())
+        );
+        assertThat(itemJson.evaluate("create.error.suppressed"), nullValue());
+    }
+
+    public void testFailureStoreCauseIsSentToNodesThatSupportIt() throws IOException {
+        Failure failure = new Failure("index", "id", new ElasticsearchException("original failure"));
+        failure.setFailureStoreStatus(IndexDocFailureStoreStatus.FAILED);
+        failure.setFailureStoreCause(new IllegalArgumentException("failure store failure"));
+
+        Failure copy = copyWriteable(
+            failure,
+            writableRegistry(),
+            Failure::new,
+            TransportVersionUtils.randomVersionSupporting(Failure.BULK_ITEM_FAILURE_STORE_CAUSE)
+        );
+
+        assertThat(copy.getFailureStoreCause(), instanceOf(IllegalArgumentException.class));
+        assertThat(copy.getFailureStoreCause().getMessage(), equalTo("failure store failure"));
+    }
+
+    /**
+     * A node that does not know about the failure store cause must still be able to read the failure and see the failure store status.
+     */
+    public void testFailureStoreCauseIsNotSentToOlderNodes() throws IOException {
+        Failure failure = new Failure("index", "id", new ElasticsearchException("original failure"));
+        failure.setFailureStoreStatus(IndexDocFailureStoreStatus.FAILED);
+        failure.setFailureStoreCause(new IllegalArgumentException("failure store failure"));
+
+        Failure copy = copyWriteable(
+            failure,
+            writableRegistry(),
+            Failure::new,
+            TransportVersionUtils.randomVersionNotSupporting(Failure.BULK_ITEM_FAILURE_STORE_CAUSE)
+        );
+
+        assertThat(copy.getFailureStoreCause(), nullValue());
+        assertThat(copy.getFailureStoreStatus(), equalTo(IndexDocFailureStoreStatus.FAILED));
+        // Older versions can write the exception in a generic form that prefixes the message with the exception name
+        assertThat(copy.getCause().getMessage(), containsString("original failure"));
     }
 
     public static void assertBulkItemResponse(BulkItemResponse expected, BulkItemResponse actual) {

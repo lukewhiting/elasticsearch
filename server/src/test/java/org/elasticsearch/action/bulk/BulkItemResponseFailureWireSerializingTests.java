@@ -35,7 +35,7 @@ public class BulkItemResponseFailureWireSerializingTests extends AbstractWireSer
     @Override
     protected FailureWrapper mutateInstance(FailureWrapper instance) {
         Failure failure = instance.failure();
-        int fieldToMutate = randomIntBetween(0, 6);
+        int fieldToMutate = randomIntBetween(0, 7);
         Failure mutated = switch (fieldToMutate) {
             case 0 -> new Failure(
                 randomValueOtherThan(failure.getIndex(), () -> randomAlphaOfLengthBetween(3, 10)),
@@ -106,8 +106,23 @@ public class BulkItemResponseFailureWireSerializingTests extends AbstractWireSer
                 failure.isAborted(),
                 randomValueOtherThan(failure.getFailureStoreStatus(), () -> randomFrom(IndexDocFailureStoreStatus.values()))
             );
+            case 7 -> new Failure(
+                failure.getIndex(),
+                failure.getId(),
+                failure.getCause(),
+                failure.getSeqNo(),
+                failure.getTerm(),
+                failure.isAborted(),
+                failure.getFailureStoreStatus()
+            );
             default -> throw new AssertionError();
         };
+        Exception failureStoreCause = fieldToMutate == 7
+            ? (failure.getFailureStoreCause() == null ? randomException() : null)
+            : failure.getFailureStoreCause();
+        if (failureStoreCause != null) {
+            mutated.setFailureStoreCause(failureStoreCause);
+        }
         return new FailureWrapper(mutated);
     }
 
@@ -164,7 +179,9 @@ public class BulkItemResponseFailureWireSerializingTests extends AbstractWireSer
                 failure.isAborted(),
                 failure.getFailureStoreStatus(),
                 failure.getCause().getClass(),
-                failure.getCause().getMessage()
+                failure.getCause().getMessage(),
+                failure.getFailureStoreCause() == null ? null : failure.getFailureStoreCause().getClass(),
+                failure.getFailureStoreCause() == null ? null : failure.getFailureStoreCause().getMessage()
             );
         }
 
@@ -177,7 +194,11 @@ public class BulkItemResponseFailureWireSerializingTests extends AbstractWireSer
                 && a.getStatus() == b.getStatus()
                 && a.getFailureStoreStatus() == b.getFailureStoreStatus()
                 && a.getCause().getClass().equals(b.getCause().getClass())
-                && Objects.equals(a.getCause().getMessage(), b.getCause().getMessage());
+                && Objects.equals(a.getCause().getMessage(), b.getCause().getMessage())
+                && (a.getFailureStoreCause() == null) == (b.getFailureStoreCause() == null)
+                && (a.getFailureStoreCause() == null
+                    || (a.getFailureStoreCause().getClass().equals(b.getFailureStoreCause().getClass())
+                        && Objects.equals(a.getFailureStoreCause().getMessage(), b.getFailureStoreCause().getMessage())));
         }
     }
 
@@ -185,7 +206,7 @@ public class BulkItemResponseFailureWireSerializingTests extends AbstractWireSer
         String index = randomAlphaOfLengthBetween(3, 10);
         String id = randomBoolean() ? randomAlphaOfLengthBetween(3, 10) : null;
         Exception cause = randomException();
-        return new Failure(
+        Failure failure = new Failure(
             index,
             id,
             cause,
@@ -194,6 +215,10 @@ public class BulkItemResponseFailureWireSerializingTests extends AbstractWireSer
             randomBoolean(),
             randomFrom(IndexDocFailureStoreStatus.values())
         );
+        if (randomBoolean()) {
+            failure.setFailureStoreCause(randomException());
+        }
+        return failure;
     }
 
     static Exception randomException() {

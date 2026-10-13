@@ -952,3 +952,84 @@ teardown:
   - match: { items.1.create.failure_store: not_enabled }
   - match: { items.1.create.error.type: fail_processor_exception }
   - contains: { items.1.create.error.reason: error_message }
+
+---
+"Failure store write failure is reported once on each item":
+  - requires:
+      reason: "The failure store failure used to be added to the exception shared by all items of a shard"
+      test_runner_features: [ capabilities, allowed_warnings ]
+      capabilities:
+        - method: POST
+          path: /_bulk
+          capabilities: [ 'failure_store_cause' ]
+
+  - do:
+      allowed_warnings:
+        - "index template [generic_logs_template] has index patterns [logs-*] matching patterns from existing older templates [global] with patterns (global => [*]); this template [generic_logs_template] will take precedence during new index creation"
+      indices.put_index_template:
+        name: generic_logs_template
+        body:
+          index_patterns: logs-*
+          data_stream: {}
+          template:
+            settings:
+              number_of_shards: 1
+              number_of_replicas: 0
+            mappings:
+              properties:
+                '@timestamp':
+                  type: date
+                count:
+                  type: long
+            data_stream_options:
+              failure_store:
+                enabled: true
+
+  # The failure store index is created lazily by the first redirected document
+  - do:
+      bulk:
+        refresh: true
+        body:
+          - '{ "create": { "_index": "logs-foobar" } }'
+          - '{ "@timestamp": "2022-01-01", "count": "invalid" }'
+  - match: { items.0.create.failure_store: used }
+
+  - do:
+      indices.get_data_stream:
+        name: logs-foobar
+  - set: { data_streams.0.indices.0.index_name: backing_index }
+  - set: { data_streams.0.failure_store.indices.0.index_name: failure_index }
+
+  - do:
+      indices.put_settings:
+        index: $backing_index
+        body:
+          index.blocks.write: true
+  - match: { acknowledged: true }
+
+  - do:
+      indices.put_settings:
+        index: $failure_index
+        body:
+          index.blocks.write: true
+  - match: { acknowledged: true }
+
+  # Both documents fail on the same shard of the backing index and are then redirected to the blocked failure store
+  - do:
+      bulk:
+        body:
+          - '{ "create": { "_index": "logs-foobar" } }'
+          - '{ "@timestamp": "2022-01-02", "count": 1 }'
+          - '{ "create": { "_index": "logs-foobar" } }'
+          - '{ "@timestamp": "2022-01-03", "count": 2 }'
+  - is_true: errors
+  - match: { items.0.create.status: 403 }
+  - match: { items.0.create.failure_store: failed }
+  - match: { items.0.create.error.type: cluster_block_exception }
+  - length: { items.0.create.error.suppressed: 1 }
+  - match: { items.0.create.error.suppressed.0.type: cluster_block_exception }
+  - match: { items.1.create.status: 403 }
+  - match: { items.1.create.failure_store: failed }
+  - match: { items.1.create.error.type: cluster_block_exception }
+  - length: { items.1.create.error.suppressed: 1 }
+  - match: { items.1.create.error.suppressed.0.type: cluster_block_exception }

@@ -211,10 +211,15 @@ public class TransportBulkAction extends TransportAbstractBulkAction {
                 final Response response = (Response) bulkItemResponse.getResponse();
                 l.onResponse(response);
             } else {
-                if (IndexDocFailureStoreStatus.NOT_APPLICABLE_OR_UNKNOWN.equals(bulkItemResponse.getFailure().getFailureStoreStatus())) {
-                    l.onFailure(bulkItemResponse.getFailure().getCause());
+                final BulkItemResponse.Failure failure = bulkItemResponse.getFailure();
+                // This is the only item, so nothing else shares the cause and the failure store failure can be added to it directly.
+                if (failure.getFailureStoreCause() != null) {
+                    failure.getCause().addSuppressed(failure.getFailureStoreCause());
+                }
+                if (IndexDocFailureStoreStatus.NOT_APPLICABLE_OR_UNKNOWN.equals(failure.getFailureStoreStatus())) {
+                    l.onFailure(failure.getCause());
                 } else {
-                    l.onFailure(new IndexDocFailureStoreStatus.ExceptionWithFailureStoreStatus(bulkItemResponse.getFailure()));
+                    l.onFailure(new IndexDocFailureStoreStatus.ExceptionWithFailureStoreStatus(failure));
                 }
             }
         });
@@ -860,6 +865,10 @@ public class TransportBulkAction extends TransportAbstractBulkAction {
             clusterService.state(),
             DataStream.DATA_STREAM_FAILURE_STORE_FEATURE
         );
+        // Responses can be sent to any node, so the per-item field is only used once every node can read it
+        final boolean clusterSupportsFailureStoreCause = clusterService.state()
+            .getMinTransportVersion()
+            .supports(BulkItemResponse.Failure.BULK_ITEM_FAILURE_STORE_CAUSE);
         new BulkOperation(
             task,
             threadPool,
@@ -876,6 +885,7 @@ public class TransportBulkAction extends TransportAbstractBulkAction {
             failureStoreMetrics,
             dataStreamFailureStoreSettings,
             clusterSupportsFailureStore,
+            clusterSupportsFailureStoreCause,
             batchIndexingEnabled
         ).run();
     }
