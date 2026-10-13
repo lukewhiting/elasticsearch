@@ -211,10 +211,13 @@ public class TransportBulkAction extends TransportAbstractBulkAction {
                 final Response response = (Response) bulkItemResponse.getResponse();
                 l.onResponse(response);
             } else {
-                if (IndexDocFailureStoreStatus.NOT_APPLICABLE_OR_UNKNOWN.equals(bulkItemResponse.getFailure().getFailureStoreStatus())) {
-                    l.onFailure(bulkItemResponse.getFailure().getCause());
+                final BulkItemResponse.Failure failure = bulkItemResponse.getFailure();
+                // This is the only item, so nothing else shares the cause and the failure store failures can be added to it directly
+                failure.mergeFailureStoreFailuresIntoCause();
+                if (IndexDocFailureStoreStatus.NOT_APPLICABLE_OR_UNKNOWN.equals(failure.getFailureStoreStatus())) {
+                    l.onFailure(failure.getCause());
                 } else {
-                    l.onFailure(new IndexDocFailureStoreStatus.ExceptionWithFailureStoreStatus(bulkItemResponse.getFailure()));
+                    l.onFailure(new IndexDocFailureStoreStatus.ExceptionWithFailureStoreStatus(failure));
                 }
             }
         });

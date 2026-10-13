@@ -22,7 +22,10 @@ import org.elasticsearch.action.support.replication.ReplicationResponse;
 import org.elasticsearch.action.update.UpdateResponse;
 import org.elasticsearch.action.update.UpdateResponseTests;
 import org.elasticsearch.cluster.metadata.IndexMetadata;
+import org.elasticsearch.common.Strings;
+import org.elasticsearch.common.bytes.BytesArray;
 import org.elasticsearch.common.bytes.BytesReference;
+import org.elasticsearch.common.xcontent.XContentHelper;
 import org.elasticsearch.core.CheckedConsumer;
 import org.elasticsearch.core.Tuple;
 import org.elasticsearch.index.Index;
@@ -30,18 +33,28 @@ import org.elasticsearch.index.seqno.SequenceNumbers;
 import org.elasticsearch.index.shard.ShardId;
 import org.elasticsearch.rest.RestStatus;
 import org.elasticsearch.test.ESTestCase;
+import org.elasticsearch.test.TransportVersionUtils;
+import org.elasticsearch.test.rest.ObjectPath;
+import org.elasticsearch.transport.RemoteTransportException;
 import org.elasticsearch.xcontent.ToXContent;
 import org.elasticsearch.xcontent.XContentBuilder;
 import org.elasticsearch.xcontent.XContentParser;
 import org.elasticsearch.xcontent.XContentType;
+import org.elasticsearch.xcontent.json.JsonXContent;
 
 import java.io.IOException;
+import java.util.ArrayList;
+import java.util.List;
 
 import static org.elasticsearch.ElasticsearchExceptionTests.assertDeepEquals;
 import static org.elasticsearch.ElasticsearchExceptionTests.randomExceptions;
 import static org.elasticsearch.common.xcontent.XContentParserUtils.ensureExpectedToken;
 import static org.elasticsearch.common.xcontent.XContentParserUtils.throwUnknownField;
 import static org.hamcrest.Matchers.containsString;
+import static org.hamcrest.Matchers.equalTo;
+import static org.hamcrest.Matchers.instanceOf;
+import static org.hamcrest.Matchers.nullValue;
+import static org.hamcrest.Matchers.sameInstance;
 
 public class BulkItemResponseTests extends ESTestCase {
 
@@ -164,6 +177,157 @@ public class BulkItemResponseTests extends ESTestCase {
             assertNull(parser.nextToken());
         }
         assertBulkItemResponse(expectedBulkItemResponse, parsedBulkItemResponse);
+    }
+
+    /**
+     * The failure store failures of an item are rendered as the last suppressed exceptions of its cause, after the ones that the cause
+     * already has, without being added to the cause itself, which other items can share.
+     */
+    public void testFailureStoreFailuresAreRenderedAsLastSuppressedExceptions() throws IOException {
+        Exception cause = new ElasticsearchException("original failure");
+        cause.addSuppressed(new IllegalStateException("existing suppressed"));
+        Failure failure = new Failure("index", "id", cause);
+        failure.setFailureStoreStatus(IndexDocFailureStoreStatus.FAILED);
+        failure.addFailureStoreFailure(new IllegalArgumentException("failure store failure"));
+        BulkItemResponse item = BulkItemResponse.failure(0, DocWriteRequest.OpType.CREATE, failure);
+
+        ObjectPath itemJson = ObjectPath.createFromXContent(
+            JsonXContent.jsonXContent,
+            XContentHelper.toXContent(item, XContentType.JSON, randomBoolean())
+        );
+        assertThat(itemJson.evaluate("create.error.reason"), equalTo("original failure"));
+        assertThat(itemJson.evaluate("create.error.suppressed.0.reason"), equalTo("existing suppressed"));
+        assertThat(itemJson.evaluate("create.error.suppressed.1.reason"), equalTo("failure store failure"));
+        assertThat(itemJson.evaluate("create.failure_store"), equalTo("failed"));
+
+        ObjectPath failureJson = ObjectPath.createFromXContent(JsonXContent.jsonXContent, new BytesArray(Strings.toString(failure)));
+        assertThat(failureJson.evaluate("cause.suppressed.0.reason"), equalTo("existing suppressed"));
+        assertThat(failureJson.evaluate("cause.suppressed.1.reason"), equalTo("failure store failure"));
+
+        assertThat(failure.getCause(), sameInstance(cause));
+        assertThat(cause.getSuppressed().length, equalTo(1));
+    }
+
+    public void testNoSuppressedExceptionsWithoutFailureStoreFailures() throws IOException {
+        Failure failure = new Failure("index", "id", new ElasticsearchException("original failure"));
+        BulkItemResponse item = BulkItemResponse.failure(0, DocWriteRequest.OpType.CREATE, failure);
+
+        ObjectPath itemJson = ObjectPath.createFromXContent(
+            JsonXContent.jsonXContent,
+            XContentHelper.toXContent(item, XContentType.JSON, randomBoolean())
+        );
+        assertThat(itemJson.evaluate("create.error.suppressed"), nullValue());
+        assertThat(failure.getFailureStoreFailures().length, equalTo(0));
+    }
+
+    /**
+     * A wrapper exception is rendered as the exception that it wraps, which has no knowledge of what was suppressed on the wrapper. This is
+     * what already happened when the failure store failure was added to the cause itself, so the rendering must not change.
+     */
+    public void testFailureStoreFailuresOfAWrapperCauseAreNotRendered() {
+        Exception cause = new RemoteTransportException("remote", new ElasticsearchException("original failure"));
+        Failure without = new Failure("index", "id", cause);
+        Failure with = new Failure("index", "id", cause);
+        with.addFailureStoreFailure(new IllegalStateException("failure store failure"));
+
+        assertThat(Strings.toString(with), equalTo(Strings.toString(without)));
+    }
+
+    /**
+     * Items that share one cause each have their own failure store failures, and the shared cause is not modified.
+     */
+    public void testFailureStoreFailuresOfItemsSharingACauseStayApart() {
+        Exception sharedCause = new ElasticsearchException("original failure");
+        Failure first = new Failure("index", "1", sharedCause);
+        Failure second = new Failure("index", "2", sharedCause);
+
+        first.addFailureStoreFailure(new IllegalStateException("first failure store failure"));
+        second.addFailureStoreFailure(new IllegalStateException("second failure store failure"));
+
+        assertThat(first.getCause(), sameInstance(sharedCause));
+        assertThat(second.getCause(), sameInstance(sharedCause));
+        assertThat(sharedCause.getSuppressed().length, equalTo(0));
+        assertThat(first.getFailureStoreFailures().length, equalTo(1));
+        assertThat(first.getFailureStoreFailures()[0].getMessage(), equalTo("first failure store failure"));
+        assertThat(second.getFailureStoreFailures().length, equalTo(1));
+        assertThat(second.getFailureStoreFailures()[0].getMessage(), equalTo("second failure store failure"));
+    }
+
+    public void testMergeFailureStoreFailuresIntoCause() {
+        Exception cause = new ElasticsearchException("original failure");
+        Failure failure = new Failure("index", "id", cause);
+        failure.addFailureStoreFailure(new IllegalStateException("failure store failure"));
+
+        failure.mergeFailureStoreFailuresIntoCause();
+
+        assertThat(failure.getCause(), sameInstance(cause));
+        assertThat(cause.getSuppressed().length, equalTo(1));
+        assertThat(cause.getSuppressed()[0].getMessage(), equalTo("failure store failure"));
+        assertThat(failure.getFailureStoreFailures().length, equalTo(0));
+    }
+
+    /**
+     * The failure store failures are sent as suppressed exceptions of a copy of the cause, which is what every version reads.
+     */
+    public void testFailureStoreFailuresAreSuppressedOnTheCauseAfterTransport() throws IOException {
+        Exception cause = new ElasticsearchException("original failure");
+        cause.addSuppressed(new IllegalStateException("existing suppressed"));
+        Failure failure = new Failure("index", "id", cause);
+        failure.addFailureStoreFailure(new IllegalArgumentException("failure store failure"));
+
+        Failure received = copyWriteable(failure, writableRegistry(), Failure::new);
+
+        assertThat(received.getCause(), instanceOf(ElasticsearchException.class));
+        assertThat(received.getCause().getMessage(), equalTo("original failure"));
+        assertThat(received.getCause().getSuppressed().length, equalTo(2));
+        assertThat(received.getCause().getSuppressed()[0].getMessage(), equalTo("existing suppressed"));
+        assertThat(received.getCause().getSuppressed()[1].getMessage(), equalTo("failure store failure"));
+        assertThat(received.getFailureStoreFailures().length, equalTo(0));
+        assertThat(cause.getSuppressed().length, equalTo(1));
+    }
+
+    public void testFailureStoreFailuresAreSuppressedOnTheCauseAfterTransportToAnyVersion() throws IOException {
+        Failure failure = new Failure("index", "id", new ElasticsearchException("original failure"));
+        failure.addFailureStoreFailure(new IllegalArgumentException("failure store failure"));
+
+        Failure received = copyWriteable(failure, writableRegistry(), Failure::new, TransportVersionUtils.randomCompatibleVersion());
+
+        // Older versions can write an exception in a generic form that prefixes the message with the exception name
+        assertThat(received.getCause().getMessage(), containsString("original failure"));
+        assertThat(received.getCause().getSuppressed().length, equalTo(1));
+        assertThat(received.getCause().getSuppressed()[0].getMessage(), containsString("failure store failure"));
+    }
+
+    /**
+     * An item must render the same whether it is rendered where it was created or after it was sent to another node, for every kind of
+     * cause: registered exceptions, built-in exception types that have their own wire format, exceptions that are not serializable, and
+     * wrappers.
+     */
+    public void testFailureStoreFailuresRenderTheSameBeforeAndAfterTransport() throws IOException {
+        for (Exception cause : List.of(
+            new ElasticsearchException("original failure"),
+            new IllegalArgumentException("original failure"),
+            new RuntimeException("original failure"),
+            new RemoteTransportException("remote", new ElasticsearchException("original failure")),
+            new RemoteTransportException("remote", new IllegalArgumentException("original failure"))
+        )) {
+            Failure failure = new Failure("index", "id", cause);
+            failure.addFailureStoreFailure(new IllegalStateException("failure store failure"));
+
+            Failure received = copyWriteable(failure, writableRegistry(), Failure::new);
+
+            assertThat("for " + cause, suppressedReasons(received), equalTo(suppressedReasons(failure)));
+        }
+    }
+
+    private static List<Object> suppressedReasons(Failure failure) throws IOException {
+        ObjectPath json = ObjectPath.createFromXContent(JsonXContent.jsonXContent, new BytesArray(Strings.toString(failure)));
+        List<Object> suppressed = json.evaluate("cause.suppressed");
+        List<Object> reasons = new ArrayList<>();
+        for (int i = 0; suppressed != null && i < suppressed.size(); i++) {
+            reasons.add(json.evaluate("cause.suppressed." + i + ".reason"));
+        }
+        return reasons;
     }
 
     public static void assertBulkItemResponse(BulkItemResponse expected, BulkItemResponse actual) {

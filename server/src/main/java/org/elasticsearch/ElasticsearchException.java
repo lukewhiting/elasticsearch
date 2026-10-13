@@ -389,10 +389,18 @@ public class ElasticsearchException extends RuntimeException implements ToXConte
     }
 
     private static Writer<Throwable> createNestingFunction(int thisLevel, Runnable nestedExceptionLimitCallback) {
+        return createNestingFunction(thisLevel, nestedExceptionLimitCallback, NO_SUPPRESSED);
+    }
+
+    private static Writer<Throwable> createNestingFunction(
+        int thisLevel,
+        Runnable nestedExceptionLimitCallback,
+        Throwable[] additionalSuppressed
+    ) {
         int nextLevel = thisLevel + 1;
         return (o, t) -> {
             writeException(t.getCause(), o, nextLevel, nestedExceptionLimitCallback);
-            writeStackTraces(t, o, (no, nt) -> writeException(nt, no, nextLevel, nestedExceptionLimitCallback));
+            writeStackTraces(t, o, (no, nt) -> writeException(nt, no, nextLevel, nestedExceptionLimitCallback), additionalSuppressed);
         };
     }
 
@@ -461,6 +469,19 @@ public class ElasticsearchException extends RuntimeException implements ToXConte
         Throwable cause,
         int nestedLevel
     ) throws IOException {
+        innerToXContent(builder, params, throwable, headers, metadata, cause, nestedLevel, throwable.getSuppressed());
+    }
+
+    private static void innerToXContent(
+        XContentBuilder builder,
+        Params params,
+        Throwable throwable,
+        Map<String, List<String>> headers,
+        Map<String, List<String>> metadata,
+        Throwable cause,
+        int nestedLevel,
+        Throwable[] allSuppressed
+    ) throws IOException {
 
         if (nestedLevel > MAX_NESTED_EXCEPTION_LEVEL) {
             var terminalException = new IllegalStateException("too many nested exceptions");
@@ -503,7 +524,6 @@ public class ElasticsearchException extends RuntimeException implements ToXConte
             builder.field(STACK_TRACE, ExceptionsHelper.stackTrace(throwable));
         }
 
-        Throwable[] allSuppressed = throwable.getSuppressed();
         if (allSuppressed.length > 0) {
             builder.startArray(SUPPRESSED.getPreferredName());
             for (Throwable suppressed : allSuppressed) {
@@ -668,6 +688,36 @@ public class ElasticsearchException extends RuntimeException implements ToXConte
      */
     public static void generateThrowableXContent(XContentBuilder builder, Params params, Throwable t) throws IOException {
         generateThrowableXContent(builder, params, t, 0);
+    }
+
+    /**
+     * Renders {@code t} like {@link #generateThrowableXContent(XContentBuilder, Params, Throwable)} would after
+     * {@code additionalSuppressed} had been added to {@code t} with {@link Throwable#addSuppressed}, without modifying {@code t}. They are
+     * rendered after its own suppressed exceptions and only for {@code t} itself, not for its causes or its suppressed exceptions.
+     * <p>
+     * This is for an exception that is shared by many results, where each result has its own additional suppressed exceptions. Adding
+     * them to the shared exception would give every result all of them.
+     * <p>
+     * Two details follow from that equivalence. If {@code t} is an {@link ElasticsearchWrapperException} the rendering shows the wrapped
+     * exception, as it does for any wrapper, and the additional suppressed exceptions are not shown. And {@code t} is rendered by the
+     * generic code, so a {@code toXContent} override on its class is not used.
+     */
+    public static void generateThrowableXContentWithSuppressed(
+        XContentBuilder builder,
+        Params params,
+        Throwable t,
+        Throwable[] additionalSuppressed
+    ) throws IOException {
+        if (additionalSuppressed.length == 0 || ExceptionsHelper.unwrapCause(t) != t) {
+            generateThrowableXContent(builder, params, t);
+            return;
+        }
+        Throwable[] allSuppressed = withAdditionalSuppressed(t, additionalSuppressed);
+        if (t instanceof ElasticsearchException e) {
+            innerToXContent(builder, params, e, e.bodyHeaders, e.metadata, e.getCause(), 0, allSuppressed);
+        } else {
+            innerToXContent(builder, params, t, emptyMap(), emptyMap(), t.getCause(), 0, allSuppressed);
+        }
     }
 
     /**
@@ -879,13 +929,32 @@ public class ElasticsearchException extends RuntimeException implements ToXConte
      * Serializes the given exceptions stacktrace elements as well as it's suppressed exceptions to the given output stream.
      */
     public static void writeStackTraces(Throwable throwable, StreamOutput out, Writer<Throwable> exceptionWriter) throws IOException {
+        writeStackTraces(throwable, out, exceptionWriter, NO_SUPPRESSED);
+    }
+
+    private static void writeStackTraces(
+        Throwable throwable,
+        StreamOutput out,
+        Writer<Throwable> exceptionWriter,
+        Throwable[] additionalSuppressed
+    ) throws IOException {
         out.writeArray((o, v) -> {
             o.writeString(v.getClassName());
             o.writeOptionalString(v.getFileName());
             o.writeString(v.getMethodName());
             o.writeVInt(v.getLineNumber());
         }, throwable.getStackTrace());
-        out.writeArray(exceptionWriter, throwable.getSuppressed());
+        out.writeArray(exceptionWriter, withAdditionalSuppressed(throwable, additionalSuppressed));
+    }
+
+    private static Throwable[] withAdditionalSuppressed(Throwable throwable, Throwable[] additionalSuppressed) {
+        Throwable[] own = throwable.getSuppressed();
+        if (additionalSuppressed.length == 0) {
+            return own;
+        }
+        Throwable[] all = Arrays.copyOf(own, own.length + additionalSuppressed.length);
+        System.arraycopy(additionalSuppressed, 0, all, own.length, additionalSuppressed.length);
+        return all;
     }
 
     /**
@@ -895,14 +964,38 @@ public class ElasticsearchException extends RuntimeException implements ToXConte
         writeException(throwable, output, () -> {});
     }
 
+    /**
+     * Writes the specified {@code throwable} to {@link StreamOutput} {@code output} as if {@code additionalSuppressed} had been added to it
+     * with {@link Throwable#addSuppressed}, without modifying it. They are written after its own suppressed exceptions and only on
+     * {@code throwable} itself, not on its causes or on its suppressed exceptions. A receiver reads the result like any other exception.
+     * <p>
+     * This is for an exception that is shared by many results, where each result has its own additional suppressed exceptions. Adding
+     * them to the shared exception would give every result all of them.
+     */
+    public static void writeException(Throwable throwable, StreamOutput output, Throwable[] additionalSuppressed) throws IOException {
+        writeException(throwable, output, 0, () -> {}, additionalSuppressed);
+    }
+
     static void writeException(Throwable throwable, StreamOutput output, Runnable nestedExceptionLimitCallback) throws IOException {
         writeException(throwable, output, 0, nestedExceptionLimitCallback);
     }
 
     private static final int MAX_NESTED_EXCEPTION_LEVEL = 100;
 
+    private static final Throwable[] NO_SUPPRESSED = new Throwable[0];
+
     private static void writeException(Throwable throwable, StreamOutput output, int nestedLevel, Runnable nestedExceptionLimitCallback)
         throws IOException {
+        writeException(throwable, output, nestedLevel, nestedExceptionLimitCallback, NO_SUPPRESSED);
+    }
+
+    private static void writeException(
+        Throwable throwable,
+        StreamOutput output,
+        int nestedLevel,
+        Runnable nestedExceptionLimitCallback,
+        Throwable[] additionalSuppressed
+    ) throws IOException {
         if (nestedLevel > MAX_NESTED_EXCEPTION_LEVEL) {
             nestedExceptionLimitCallback.run();
             writeException(new IllegalStateException("too many nested exceptions"), output);
@@ -1014,7 +1107,7 @@ public class ElasticsearchException extends RuntimeException implements ToXConte
             }
             output.writeVInt(0);
             output.writeVInt(getId(ex.getClass()));
-            ex.writeTo(output, createNestingFunction(nestedLevel, nestedExceptionLimitCallback));
+            ex.writeTo(output, createNestingFunction(nestedLevel, nestedExceptionLimitCallback, additionalSuppressed));
             return;
         }
 
@@ -1024,7 +1117,12 @@ public class ElasticsearchException extends RuntimeException implements ToXConte
         if (writeCause) {
             writeException(throwable.getCause(), output, nestedLevel + 1, nestedExceptionLimitCallback);
         }
-        writeStackTraces(throwable, output, (o, t) -> writeException(t, o, nestedLevel + 1, nestedExceptionLimitCallback));
+        writeStackTraces(
+            throwable,
+            output,
+            (o, t) -> writeException(t, o, nestedLevel + 1, nestedExceptionLimitCallback),
+            additionalSuppressed
+        );
     }
 
     /**

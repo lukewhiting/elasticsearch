@@ -63,6 +63,7 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 import java.util.Map;
+import java.util.function.Supplier;
 
 import static java.util.Collections.emptyList;
 import static java.util.Collections.singleton;
@@ -1579,6 +1580,100 @@ public class ElasticsearchExceptionTests extends ESTestCase {
         assertThat(ser, instanceOf(rootException.getClass()));
         assertThat(ser.getMessage(), equalTo(rootException.getMessage()));
         assertArrayEquals(ser.getStackTrace(), rootException.getStackTrace());
+    }
+
+    private static List<Supplier<Exception>> exceptionsForAdditionalSuppressed() {
+        return List.of(
+            () -> new ElasticsearchException("original", new IllegalStateException("inner")),
+            () -> new IllegalArgumentException("original", new IllegalStateException("inner")),
+            () -> new RuntimeException("original", new IllegalStateException("inner")),
+            () -> new RemoteTransportException("remote", new ElasticsearchException("original", new IllegalStateException("inner")))
+        );
+    }
+
+    /**
+     * Writing with additional suppressed exceptions must give exactly the bytes of writing the exception after adding them to it, for
+     * every kind of exception, while leaving the exception that was written untouched.
+     */
+    public void testWriteExceptionWithAdditionalSuppressedMatchesAddingThem() throws IOException {
+        Throwable[] additional = new Throwable[] { new IllegalStateException("first extra"), new IllegalArgumentException("second extra") };
+        Exception ownSuppressed = new IllegalStateException("own suppressed");
+        for (Supplier<Exception> supplier : exceptionsForAdditionalSuppressed()) {
+            Exception shared = supplier.get();
+            Exception copy = supplier.get();
+            // The exceptions are created at different lines, which would make their stack traces and so their bytes differ
+            for (Throwable root : new Throwable[] { shared, copy, ownSuppressed, additional[0], additional[1] }) {
+                for (Throwable throwable = root; throwable != null; throwable = throwable.getCause()) {
+                    throwable.setStackTrace(new StackTraceElement[0]);
+                }
+            }
+            shared.addSuppressed(ownSuppressed);
+            copy.addSuppressed(ownSuppressed);
+            copy.addSuppressed(additional[0]);
+            copy.addSuppressed(additional[1]);
+
+            BytesStreamOutput actual = new BytesStreamOutput();
+            ElasticsearchException.writeException(shared, actual, additional);
+            BytesStreamOutput expected = new BytesStreamOutput();
+            ElasticsearchException.writeException(copy, expected);
+
+            assertThat("for " + shared, actual.bytes(), equalTo(expected.bytes()));
+            assertThat(shared.getSuppressed().length, equalTo(1));
+        }
+    }
+
+    /**
+     * Additional suppressed exceptions are only written for the exception itself, and not for its cause.
+     */
+    public void testWriteExceptionWithAdditionalSuppressedOnlyAppliesToTheTopLevelException() throws IOException {
+        for (Supplier<Exception> supplier : exceptionsForAdditionalSuppressed()) {
+            Exception exception = supplier.get();
+            BytesStreamOutput out = new BytesStreamOutput();
+
+            ElasticsearchException.writeException(exception, out, new Throwable[] { new IllegalStateException("extra") });
+            Throwable read = out.bytes().streamInput().readException();
+
+            assertThat("for " + exception, read.getSuppressed().length, equalTo(1));
+            assertThat(read.getSuppressed()[0].getMessage(), equalTo("extra"));
+            assertThat(read.getCause().getSuppressed().length, equalTo(0));
+        }
+    }
+
+    /**
+     * Rendering with additional suppressed exceptions must give exactly the rendering of the exception after adding them to it, for every
+     * kind of exception, including wrappers that render as the exception that they wrap.
+     */
+    public void testGenerateThrowableXContentWithSuppressedMatchesAddingThem() throws IOException {
+        Throwable[] additional = new Throwable[] { new IllegalStateException("first extra"), new IllegalArgumentException("second extra") };
+        for (Supplier<Exception> supplier : exceptionsForAdditionalSuppressed()) {
+            Exception shared = supplier.get();
+            Exception copy = supplier.get();
+            shared.addSuppressed(new IllegalStateException("own suppressed"));
+            copy.addSuppressed(new IllegalStateException("own suppressed"));
+            copy.addSuppressed(additional[0]);
+            copy.addSuppressed(additional[1]);
+
+            XContentBuilder actual = XContentFactory.jsonBuilder().startObject();
+            ElasticsearchException.generateThrowableXContentWithSuppressed(actual, ToXContent.EMPTY_PARAMS, shared, additional);
+            XContentBuilder expected = XContentFactory.jsonBuilder().startObject();
+            ElasticsearchException.generateThrowableXContent(expected, ToXContent.EMPTY_PARAMS, copy);
+
+            assertThat("for " + shared, Strings.toString(actual.endObject()), equalTo(Strings.toString(expected.endObject())));
+            assertThat(shared.getSuppressed().length, equalTo(1));
+        }
+    }
+
+    public void testGenerateThrowableXContentWithoutAdditionalSuppressedChangesNothing() throws IOException {
+        for (Supplier<Exception> supplier : exceptionsForAdditionalSuppressed()) {
+            Exception exception = supplier.get();
+
+            XContentBuilder actual = XContentFactory.jsonBuilder().startObject();
+            ElasticsearchException.generateThrowableXContentWithSuppressed(actual, ToXContent.EMPTY_PARAMS, exception, new Throwable[0]);
+            XContentBuilder expected = XContentFactory.jsonBuilder().startObject();
+            ElasticsearchException.generateThrowableXContent(expected, ToXContent.EMPTY_PARAMS, exception);
+
+            assertThat("for " + exception, Strings.toString(actual.endObject()), equalTo(Strings.toString(expected.endObject())));
+        }
     }
 
     static class TimeoutSubclass extends ElasticsearchException {

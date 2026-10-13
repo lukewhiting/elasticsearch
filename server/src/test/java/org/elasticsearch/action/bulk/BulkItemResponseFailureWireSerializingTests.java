@@ -185,7 +185,7 @@ public class BulkItemResponseFailureWireSerializingTests extends AbstractWireSer
         String index = randomAlphaOfLengthBetween(3, 10);
         String id = randomBoolean() ? randomAlphaOfLengthBetween(3, 10) : null;
         Exception cause = randomException();
-        return new Failure(
+        Failure failure = new Failure(
             index,
             id,
             cause,
@@ -194,6 +194,11 @@ public class BulkItemResponseFailureWireSerializingTests extends AbstractWireSer
             randomBoolean(),
             randomFrom(IndexDocFailureStoreStatus.values())
         );
+        // They are sent as suppressed exceptions of the cause, so the instance that is read back has an equal cause
+        if (randomBoolean()) {
+            failure.addFailureStoreFailure(randomException());
+        }
+        return failure;
     }
 
     static Exception randomException() {

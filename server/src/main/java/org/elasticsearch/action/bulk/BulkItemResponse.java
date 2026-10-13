@@ -58,7 +58,7 @@ public class BulkItemResponse implements Writeable, ToXContentObject {
             builder.field(STATUS, failure.getStatus().getStatus());
             failure.getFailureStoreStatus().toXContent(builder, params);
             builder.startObject(ERROR);
-            ElasticsearchException.generateThrowableXContent(builder, params, failure.getCause());
+            failure.causeToXContent(builder, params);
             builder.endObject();
         }
         builder.endObject();
@@ -75,9 +75,14 @@ public class BulkItemResponse implements Writeable, ToXContentObject {
         public static final String CAUSE_FIELD = "cause";
         public static final String STATUS_FIELD = "status";
 
+        private static final Throwable[] NO_FAILURE_STORE_FAILURES = new Throwable[0];
+
         private final String index;
         private final String id;
-        private final Exception cause;
+        /**
+         * The original cause, or a {@link SharedCauseWrapper} around it once there are failure store failures. Never exposed as it is.
+         */
+        private Exception cause;
         private final RestStatus status;
         private final long seqNo;
         private final long term;
@@ -212,7 +217,12 @@ public class BulkItemResponse implements Writeable, ToXContentObject {
         public void writeTo(StreamOutput out) throws IOException {
             out.writeString(index);
             out.writeOptionalString(id);
-            out.writeException(cause);
+            if (cause instanceof SharedCauseWrapper wrapper) {
+                // Written as the shared cause with the failure store failures suppressed, which any version can read
+                ElasticsearchException.writeException(wrapper.sharedCause(), out, wrapper.getSuppressed());
+            } else {
+                out.writeException(cause);
+            }
             out.writeZLong(seqNo);
             out.writeVLong(term);
             out.writeBoolean(aborted);
@@ -237,7 +247,7 @@ public class BulkItemResponse implements Writeable, ToXContentObject {
          * The failure message.
          */
         public String getMessage() {
-            return this.cause.toString();
+            return getCause().toString();
         }
 
         /**
@@ -248,10 +258,48 @@ public class BulkItemResponse implements Writeable, ToXContentObject {
         }
 
         /**
-         * The actual cause of the failure.
+         * The actual cause of the failure. Several items can share one cause instance, for example when a whole shard bulk fails, so it
+         * does not contain the {@link #getFailureStoreFailures() failure store failures} of this item as suppressed exceptions. They are
+         * suppressed exceptions of the cause when this failure is read from a stream or rendered.
          */
         public Exception getCause() {
-            return cause;
+            return cause instanceof SharedCauseWrapper wrapper ? wrapper.sharedCause() : cause;
+        }
+
+        /**
+         * The exceptions that stopped this item from being stored in the failure store, in the order they happened. Empty if there are
+         * none, and always empty for a failure that was read from a stream, where they are suppressed exceptions of {@link #getCause()}.
+         */
+        public Throwable[] getFailureStoreFailures() {
+            return cause instanceof SharedCauseWrapper wrapper ? wrapper.getSuppressed() : NO_FAILURE_STORE_FAILURES;
+        }
+
+        /**
+         * Records an exception that stopped this item from being stored in the failure store. It is not added to {@link #getCause()}
+         * because other items may share that instance.
+         */
+        void addFailureStoreFailure(Exception failureStoreFailure) {
+            if (cause instanceof SharedCauseWrapper == false) {
+                cause = new SharedCauseWrapper(cause);
+            }
+            cause.addSuppressed(failureStoreFailure);
+        }
+
+        /**
+         * Adds the {@link #getFailureStoreFailures() failure store failures} to {@link #getCause()}. Only for when no other item shares the
+         * cause, for example in a bulk request with a single item.
+         */
+        void mergeFailureStoreFailuresIntoCause() {
+            if (cause instanceof SharedCauseWrapper wrapper) {
+                for (Throwable failureStoreFailure : wrapper.getSuppressed()) {
+                    wrapper.sharedCause().addSuppressed(failureStoreFailure);
+                }
+                cause = wrapper.sharedCause();
+            }
+        }
+
+        private void causeToXContent(XContentBuilder builder, Params params) throws IOException {
+            ElasticsearchException.generateThrowableXContentWithSuppressed(builder, params, getCause(), getFailureStoreFailures());
         }
 
         /**
@@ -296,7 +344,7 @@ public class BulkItemResponse implements Writeable, ToXContentObject {
                 builder.field(ID_FIELD, id);
             }
             builder.startObject(CAUSE_FIELD);
-            ElasticsearchException.generateThrowableXContent(builder, params, cause);
+            causeToXContent(builder, params);
             builder.endObject();
             builder.field(STATUS_FIELD, status.getStatus());
             failureStoreStatus.toXContent(builder, params);
@@ -306,6 +354,29 @@ public class BulkItemResponse implements Writeable, ToXContentObject {
         @Override
         public String toString() {
             return Strings.toString(this);
+        }
+
+        /**
+         * The cause of a failure that has failure store failures. Items can share one cause, for example when a whole shard bulk fails,
+         * but each item has its own failure store failures. They are added as suppressed exceptions to a wrapper that belongs to one item,
+         * so the shared cause is not modified and every item holds only its own, which keeps the size of the response linear.
+         * <p>
+         * The wrapper must never leave {@link Failure}: it is not a registered exception, so it would not survive serialization, and
+         * code that inspects the type of the cause would not recognise it. {@link Failure} unwraps it for {@link Failure#getCause()},
+         * and for serialization and rendering, where it is replaced by the shared cause with the suppressed exceptions added.
+         */
+        private static final class SharedCauseWrapper extends RuntimeException {
+            private final Exception sharedCause;
+
+            SharedCauseWrapper(Exception sharedCause) {
+                // No message, as it would be computed for every item, and no stack trace, as it is never shown
+                super(null, sharedCause, true, false);
+                this.sharedCause = sharedCause;
+            }
+
+            Exception sharedCause() {
+                return sharedCause;
+            }
         }
     }
 
